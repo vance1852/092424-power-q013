@@ -6,9 +6,10 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
+from plant_science.analysis import ALGORITHM_VERSION
 from plant_science.clock import FrozenClock
 from plant_science.errors import Conflict, Forbidden, InvalidState
-from plant_science.jsonio import load_json
+from plant_science.jsonio import content_digest, load_json
 from plant_science.service import TrialService
 
 
@@ -118,6 +119,88 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(second["lease_owner"], "worker-b")
         with self.assertRaises(InvalidState):
             self.service.complete_job("worker-a", first["job_id"], "stat")
+
+    def _complete_analysis(self) -> dict:
+        self.service.import_observations("operator", "batch-a", "key-1", self.rows)
+        self.service.seal_batch("stat", "batch-a", 2)
+        job = self.service.claim_job("worker", 30)
+        return self.service.complete_job("worker", job["job_id"], "stat")
+
+    def test_analysis_records_snapshot_and_algorithm_version(self) -> None:
+        completed = self._complete_analysis()
+        self.assertEqual(completed["conclusion"], "pass")
+        self.assertEqual(completed["insufficient"], [])
+        row = self.connection.execute(
+            "SELECT * FROM analyses WHERE analysis_id=?", (completed["analysis_id"],)
+        ).fetchone()
+        self.assertEqual(row["algorithm_version"], ALGORITHM_VERSION)
+        snapshot = json.loads(row["snapshot_json"])
+        self.assertEqual(len(snapshot), 6)
+        self.assertEqual(content_digest(snapshot), row["input_sha256"])
+        report = self.service.report("auditor", "batch-a")
+        self.assertEqual(len(report["analysis"]["snapshot"]), 6)
+        self.assertEqual(report["analysis"]["algorithm_version"], ALGORITHM_VERSION)
+
+    def test_complete_job_returns_each_insufficient_condition(self) -> None:
+        partial = [row for row in self.rows if row["stratum_key"] == "clear-aisle"]
+        self.service.import_observations("operator", "batch-a", "key-1", partial)
+        self.service.seal_batch("stat", "batch-a", 2)
+        job = self.service.claim_job("worker", 30)
+        completed = self.service.complete_job("worker", job["job_id"], "stat")
+        self.assertEqual(completed["conclusion"], "insufficient")
+        conditions = {(item["stratum"], item["condition"]) for item in completed["insufficient"]}
+        self.assertIn(("cross-traffic", "stratum_missing"), conditions)
+
+    def test_replay_analysis_reproduces_stored_result(self) -> None:
+        completed = self._complete_analysis()
+        replay = self.service.replay_analysis("auditor", completed["analysis_id"])
+        self.assertTrue(replay["snapshot_integrity"])
+        self.assertTrue(replay["replay_matches"])
+        self.assertEqual(replay["conclusion"], "pass")
+        self.assertEqual(replay["algorithm_version"], ALGORITHM_VERSION)
+        self.assertEqual(replay["current_algorithm_version"], ALGORITHM_VERSION)
+
+    def test_replay_requires_privileged_role(self) -> None:
+        completed = self._complete_analysis()
+        with self.assertRaises(Forbidden):
+            self.service.replay_analysis("operator", completed["analysis_id"])
+
+    def test_review_and_approval_roles_are_separated(self) -> None:
+        completed = self._complete_analysis()
+        with self.assertRaises(Forbidden):
+            self.service.decide("stat", "batch-a", completed["analysis_id"], "approved", "越权批准")
+        with self.assertRaises(Forbidden):
+            self.service.decide("operator", "batch-a", completed["analysis_id"], "approved", "越权批准")
+
+    def test_approver_cannot_run_analysis(self) -> None:
+        self.service.import_observations("operator", "batch-a", "key-1", self.rows)
+        self.service.seal_batch("stat", "batch-a", 2)
+        job = self.service.claim_job("worker", 30)
+        with self.assertRaises(Forbidden):
+            self.service.complete_job("worker", job["job_id"], "approver")
+
+    def test_decided_batch_is_immutable_to_backfilled_data(self) -> None:
+        completed = self._complete_analysis()
+        self.service.decide("approver", "batch-a", completed["analysis_id"], "approved", "满足规则")
+        with self.assertRaises(InvalidState):
+            self.service.import_observations("operator", "batch-a", "key-2", self.rows)
+        with self.assertRaises(InvalidState):
+            self.service.decide("approver", "batch-a", completed["analysis_id"], "rejected", "补录后改判")
+        report = self.service.report("auditor", "batch-a")
+        self.assertEqual(report["batch"]["state"], "decided")
+        self.assertEqual(report["decision"]["decision"], "approved")
+        self.assertEqual(report["analysis"]["result"]["conclusion"], "pass")
+
+    def test_backfilled_data_requires_new_batch_and_preserves_history(self) -> None:
+        completed = self._complete_analysis()
+        self.service.decide("approver", "batch-a", completed["analysis_id"], "approved", "满足规则")
+        self.service.create_batch("operator", "batch-b", "demo-delivery-v1", 1, "build-a")
+        self.service.start_batch("operator", "batch-b", 1)
+        imported = self.service.import_observations("operator", "batch-b", "key-9", self.rows)
+        self.assertEqual(imported["inserted"], 6)
+        report = self.service.report("auditor", "batch-a")
+        self.assertEqual(report["batch"]["state"], "decided")
+        self.assertEqual(report["decision"]["decision"], "approved")
 
 
 if __name__ == "__main__":

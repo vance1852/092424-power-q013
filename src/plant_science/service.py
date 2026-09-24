@@ -423,13 +423,16 @@ class TrialService:
             {
                 "source_batch": item.source_batch,
                 "source_row": item.source_row,
+                "robot_id": item.robot_id,
                 "stratum": item.stratum_key,
+                "observed_at": item.observed_at,
                 "metrics": {key: format(value, "f") for key, value in item.metrics.items()},
                 "excluded_reason": item.excluded_reason,
             }
             for item in observations
         ]
         input_digest = content_digest(snapshot_rows)
+        snapshot_json = canonical_json(snapshot_rows)
         result = analyze(protocol, observations)
         with transaction(self.connection, immediate=True):
             existing = self.connection.execute(
@@ -438,11 +441,12 @@ class TrialService:
             ).fetchone()
             if existing is None:
                 cursor = self.connection.execute(
-                    "INSERT INTO analyses(batch_id,batch_revision,protocol_sha256,input_sha256,algorithm_version,seed," 
-                    "result_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO analyses(batch_id,batch_revision,protocol_sha256,input_sha256,algorithm_version,seed,"
+                    "result_json,snapshot_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (
                         batch["batch_id"], job["batch_revision"], protocol_digest, input_digest,
-                        ALGORITHM_VERSION, protocol.seed, canonical_json(result), statistician_id, self._now(),
+                        ALGORITHM_VERSION, protocol.seed, canonical_json(result), snapshot_json,
+                        statistician_id, self._now(),
                     ),
                 )
                 analysis_id = cursor.lastrowid
@@ -465,7 +469,68 @@ class TrialService:
                 statistician_id,
                 {"analysis_id": analysis_id, "input_sha256": input_digest},
             )
-        return {"analysis_id": analysis_id, "input_sha256": input_digest, "result": result}
+        return {
+            "analysis_id": analysis_id,
+            "input_sha256": input_digest,
+            "conclusion": result["conclusion"],
+            "insufficient": result["insufficient"],
+            "result": result,
+        }
+
+    def replay_analysis(self, actor_id: str, analysis_id: int) -> dict[str, Any]:
+        """用记录的快照与固定种子重放分析，验证结果可复现。"""
+
+        user = self._user(actor_id)
+        if user["role"] not in {"statistician", "approver", "auditor"}:
+            raise Forbidden("当前角色不能重放分析")
+        row = self.connection.execute(
+            "SELECT * FROM analyses WHERE analysis_id=?", (analysis_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("分析版本不存在")
+        if not row["snapshot_json"]:
+            raise InvalidState("该分析缺少输入观测快照，无法重放")
+        batch = self.get_batch(row["batch_id"])
+        protocol, _ = self._protocol(batch["protocol_id"], batch["protocol_version"])
+        snapshot_rows = json.loads(row["snapshot_json"])
+        observations = tuple(
+            Observation(
+                source_batch=item["source_batch"],
+                source_row=item["source_row"],
+                robot_id=item["robot_id"],
+                protocol_id=protocol.protocol_id,
+                protocol_version=protocol.version,
+                stratum_key=item["stratum"],
+                observed_at=item["observed_at"],
+                metrics={key: Decimal(str(value)) for key, value in item["metrics"].items()},
+                excluded_reason=item["excluded_reason"],
+            )
+            for item in snapshot_rows
+        )
+        input_digest = content_digest(snapshot_rows)
+        recomputed = analyze(protocol, observations)
+        stored_result = json.loads(row["result_json"])
+        replay_matches = canonical_json(recomputed) == canonical_json(stored_result)
+        response = {
+            "analysis_id": row["analysis_id"],
+            "batch_id": row["batch_id"],
+            "algorithm_version": row["algorithm_version"],
+            "current_algorithm_version": ALGORITHM_VERSION,
+            "input_sha256": row["input_sha256"],
+            "snapshot_integrity": input_digest == row["input_sha256"],
+            "replay_matches": replay_matches,
+            "conclusion": recomputed["conclusion"],
+            "insufficient": recomputed["insufficient"],
+        }
+        with transaction(self.connection, immediate=True):
+            self._audit(
+                "analysis",
+                str(row["analysis_id"]),
+                "analysis.replayed",
+                actor_id,
+                {"replay_matches": replay_matches, "snapshot_integrity": response["snapshot_integrity"]},
+            )
+        return response
 
     def fail_job(self, worker_id: str, job_id: int, error: str, retry_seconds: int = 0) -> dict[str, Any]:
         available = isoformat(self.clock.now() + timedelta(seconds=retry_seconds))
@@ -552,6 +617,7 @@ class TrialService:
                 "input_sha256": analysis_row["input_sha256"],
                 "algorithm_version": analysis_row["algorithm_version"],
                 "created_by": analysis_row["created_by"],
+                "snapshot": None if not analysis_row["snapshot_json"] else json.loads(analysis_row["snapshot_json"]),
                 "result": json.loads(analysis_row["result_json"]),
             },
             "decision": None if decision_row is None else dict(decision_row),

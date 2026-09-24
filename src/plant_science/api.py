@@ -127,6 +127,9 @@ class JsonApplication:
                     payload["worker_id"], int(parts[1]), payload["error"], int(payload.get("retry_seconds", 0))
                 )
                 return Response(200, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "analyses" and parts[2] == "replay":
+                result = self.service.replay_analysis(self._actor(normalized_headers), int(parts[1]))
+                return Response(200, result)
             if method == "POST" and path == "/decisions":
                 result = self.service.decide(
                     self._actor(normalized_headers), payload["batch_id"], int(payload["analysis_id"]),

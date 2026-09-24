@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .jsonio import load_json
 from .service import TrialService
-from .storage import connect, inspect_schema
+from .storage import SCHEMA_VERSION, connect, inspect_schema
 
 
 def run(workspace: Path) -> dict[str, object]:
@@ -50,7 +50,7 @@ def run(workspace: Path) -> dict[str, object]:
             schema = inspect_schema(connection)
         finally:
             connection.close()
-    if schema["missing_tables"] or schema["schema_version"] != "2":
+    if schema["missing_tables"] or schema["schema_version"] != str(SCHEMA_VERSION):
         raise RuntimeError("SQLite 基础结构检查失败")
     return {
         "status": "ok",

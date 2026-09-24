@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -132,6 +132,7 @@ CREATE TABLE IF NOT EXISTS analyses (
     algorithm_version TEXT NOT NULL,
     seed INTEGER NOT NULL,
     result_json TEXT NOT NULL,
+    snapshot_json TEXT,
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
     UNIQUE (batch_id, batch_revision, input_sha256)
@@ -190,11 +191,25 @@ def transaction(connection: sqlite3.Connection, *, immediate: bool = False) -> I
         connection.commit()
 
 
+def _migrate(connection: sqlite3.Connection, previous: int) -> None:
+    """把旧版本数据库补齐到当前结构，迁移可以重复执行。"""
+
+    if previous < 3:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(analyses)")}
+        if "snapshot_json" not in columns:
+            connection.execute("ALTER TABLE analyses ADD COLUMN snapshot_json TEXT")
+
+
 def initialize(connection: sqlite3.Connection) -> None:
     """初始化基础资料表，重复执行不改变已有数据。"""
 
     connection.executescript(SCHEMA_SQL)
     with transaction(connection, immediate=True):
+        row = connection.execute(
+            "SELECT value FROM schema_meta WHERE key='schema_version'"
+        ).fetchone()
+        previous = SCHEMA_VERSION if row is None else int(row[0])
+        _migrate(connection, previous)
         connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
