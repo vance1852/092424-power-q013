@@ -57,6 +57,22 @@ class ContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "必须是 0 或 1"):
             Observation.from_dict(raw, self.protocol)
 
+    def test_null_metric_reading_is_missing(self) -> None:
+        raw = {
+            "source_batch": "batch",
+            "source_row": "1",
+            "robot_id": "r1",
+            "protocol_id": self.protocol.protocol_id,
+            "protocol_version": self.protocol.version,
+            "stratum_key": "clear-aisle",
+            "observed_at": "2026-09-21T10:00:00+08:00",
+            "metrics": {"completed": 0, "completion_seconds": None, "interventions": 0},
+            "excluded_reason": None,
+        }
+        observation = Observation.from_dict(raw, self.protocol)
+        self.assertIsNone(observation.metrics["completion_seconds"])
+        self.assertEqual(observation.metrics["completed"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

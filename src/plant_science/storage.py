@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -129,12 +129,24 @@ CREATE TABLE IF NOT EXISTS analyses (
     batch_revision INTEGER NOT NULL,
     protocol_sha256 TEXT NOT NULL CHECK (length(protocol_sha256) = 64),
     input_sha256 TEXT NOT NULL CHECK (length(input_sha256) = 64),
+    input_snapshot_json TEXT NOT NULL,
     algorithm_version TEXT NOT NULL,
     seed INTEGER NOT NULL,
     result_json TEXT NOT NULL,
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
     UNIQUE (batch_id, batch_revision, input_sha256)
+);
+
+CREATE TABLE IF NOT EXISTS analysis_reviews (
+    review_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    analysis_id INTEGER NOT NULL REFERENCES analyses(analysis_id),
+    batch_id TEXT NOT NULL REFERENCES batches(batch_id),
+    verdict TEXT NOT NULL CHECK (verdict IN ('confirmed', 'changes_requested')),
+    note TEXT NOT NULL,
+    reviewed_by TEXT NOT NULL REFERENCES users(user_id),
+    reviewed_at TEXT NOT NULL,
+    UNIQUE (analysis_id, reviewed_by)
 );
 
 CREATE TABLE IF NOT EXISTS decisions (
@@ -162,7 +174,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
 REQUIRED_TABLES = frozenset({
     "schema_meta", "protocol_catalog", "users", "robots", "builds", "batches",
     "observations", "idempotency_keys", "exclusion_requests", "analysis_jobs",
-    "analyses", "decisions", "audit_events",
+    "analyses", "analysis_reviews", "decisions", "audit_events",
 })
 
 
@@ -190,10 +202,21 @@ def transaction(connection: sqlite3.Connection, *, immediate: bool = False) -> I
         connection.commit()
 
 
+def _migrate(connection: sqlite3.Connection) -> None:
+    """为既有数据库补充新增列；历史行保留空快照占位。"""
+
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(analyses)")}
+    if columns and "input_snapshot_json" not in columns:
+        connection.execute(
+            "ALTER TABLE analyses ADD COLUMN input_snapshot_json TEXT NOT NULL DEFAULT ''"
+        )
+
+
 def initialize(connection: sqlite3.Connection) -> None:
     """初始化基础资料表，重复执行不改变已有数据。"""
 
     connection.executescript(SCHEMA_SQL)
+    _migrate(connection)
     with transaction(connection, immediate=True):
         connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "

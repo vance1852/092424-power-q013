@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .jsonio import load_json
 from .service import TrialService
-from .storage import connect, inspect_schema
+from .storage import SCHEMA_VERSION, connect, inspect_schema
 
 
 def run(workspace: Path) -> dict[str, object]:
@@ -27,6 +27,7 @@ def run(workspace: Path) -> dict[str, object]:
             service = TrialService(connection)
             service.create_user("operator-1", "测试操作员", "operator")
             service.create_user("stat-1", "统计负责人", "statistician")
+            service.create_user("stat-2", "复核统计师", "statistician")
             service.create_user("approver-1", "分析准入审批人", "approver")
             service.create_user("auditor-1", "审计人员", "auditor")
             service.register_robot("operator-1", "robot-a", "A 型人形传感器", "示例厂商")
@@ -42,6 +43,7 @@ def run(workspace: Path) -> dict[str, object]:
             if job is None:
                 raise RuntimeError("未能领取分析任务")
             analysis = service.complete_job("worker-1", job["job_id"], "stat-1")
+            service.review_analysis("stat-2", analysis["analysis_id"], "confirmed", "复核通过")
             decision_value = "approved" if analysis["result"]["conclusion"] == "pass" else "rejected"
             service.decide(
                 "approver-1", "batch-demo", analysis["analysis_id"], decision_value, "离线验收决定"
@@ -50,7 +52,7 @@ def run(workspace: Path) -> dict[str, object]:
             schema = inspect_schema(connection)
         finally:
             connection.close()
-    if schema["missing_tables"] or schema["schema_version"] != "2":
+    if schema["missing_tables"] or schema["schema_version"] != str(SCHEMA_VERSION):
         raise RuntimeError("SQLite 基础结构检查失败")
     return {
         "status": "ok",
@@ -58,6 +60,7 @@ def run(workspace: Path) -> dict[str, object]:
         "observation_count": imported["inserted"],
         "analysis_id": analysis["analysis_id"],
         "input_sha256": analysis["input_sha256"],
+        "algorithm_version": analysis["algorithm_version"],
         "conclusion": analysis["result"]["conclusion"],
         "decision": report["decision"]["decision"],
         "event_count": len(report["events"]),

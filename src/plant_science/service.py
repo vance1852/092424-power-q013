@@ -18,10 +18,10 @@ from .storage import initialize, transaction
 
 ROLE_PERMISSIONS = {
     "operator": {
-        "catalog.write", "batch.create", "batch.start", "observation.import",
+        "catalog.write", "batch.create", "batch.start", "batch.reopen", "observation.import",
         "exclusion.request", "exclusion.revoke",
     },
-    "statistician": {"protocol.publish", "batch.seal", "exclusion.review", "analysis.run"},
+    "statistician": {"protocol.publish", "batch.seal", "exclusion.review", "analysis.run", "analysis.review"},
     "approver": {"decision.write"},
     "auditor": {"report.read", "audit.read"},
 }
@@ -245,7 +245,10 @@ class TrialService:
                             item.robot_id,
                             item.stratum_key,
                             item.observed_at,
-                            canonical_json({key: format(value, "f") for key, value in item.metrics.items()}),
+                            canonical_json({
+                                key: (None if value is None else format(value, "f"))
+                                for key, value in item.metrics.items()
+                            }),
                             content_digest([raw]),
                             actor_id,
                             self._now(),
@@ -362,6 +365,46 @@ class TrialService:
             self._audit("batch", batch_id, "batch.sealed", actor_id, {"revision": new_revision})
         return self.get_batch(batch_id)
 
+    def reopen_batch(
+        self, actor_id: str, batch_id: str, expected_revision: int, reason: str
+    ) -> dict[str, Any]:
+        """在结论为补充数据后重新打开批次补录观测。
+
+        历史决定与分析全部保留，补录会产生新的批次版本、分析和决定，
+        已批准的批次不允许补录，已形成的决定不会被覆盖。
+        """
+
+        self._require(actor_id, "batch.reopen")
+        if not reason.strip():
+            raise ValidationFailed("补录原因不能为空")
+        batch = self.get_batch(batch_id)
+        if batch["state"] != "decided":
+            raise InvalidState("只有已形成决定的批次可以补录")
+        latest = self.connection.execute(
+            "SELECT d.decision FROM decisions d "
+            "JOIN analyses a ON a.analysis_id=d.analysis_id "
+            "WHERE d.batch_id=? ORDER BY d.decision_id DESC LIMIT 1",
+            (batch_id,),
+        ).fetchone()
+        if latest is None or latest["decision"] != "needs_more_data":
+            raise InvalidState("只有结论为补充数据的决定可以补录，历史决定不能被覆盖")
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE batches SET state='running',revision=revision+1 "
+                "WHERE batch_id=? AND state='decided' AND revision=?",
+                (batch_id, expected_revision),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("批次状态或版本已变化")
+            self._audit(
+                "batch",
+                batch_id,
+                "batch.reopened",
+                actor_id,
+                {"from_revision": expected_revision, "reason": reason.strip()},
+            )
+        return self.get_batch(batch_id)
+
     def claim_job(self, worker_id: str, lease_seconds: int = 60) -> dict[str, Any] | None:
         if lease_seconds <= 0:
             raise ValidationFailed("租约时长必须大于零")
@@ -402,7 +445,10 @@ class TrialService:
                 protocol_version=protocol.version,
                 stratum_key=row["stratum_key"],
                 observed_at=row["observed_at"],
-                metrics={key: Decimal(str(value)) for key, value in metrics.items()},
+                metrics={
+                    key: (None if value is None else Decimal(str(value)))
+                    for key, value in metrics.items()
+                },
                 excluded_reason=row["excluded_reason"],
             ))
         return tuple(items)
@@ -424,12 +470,16 @@ class TrialService:
                 "source_batch": item.source_batch,
                 "source_row": item.source_row,
                 "stratum": item.stratum_key,
-                "metrics": {key: format(value, "f") for key, value in item.metrics.items()},
+                "metrics": {
+                    key: (None if value is None else format(value, "f"))
+                    for key, value in item.metrics.items()
+                },
                 "excluded_reason": item.excluded_reason,
             }
             for item in observations
         ]
         input_digest = content_digest(snapshot_rows)
+        snapshot_json = canonical_json(snapshot_rows)
         result = analyze(protocol, observations)
         with transaction(self.connection, immediate=True):
             existing = self.connection.execute(
@@ -438,11 +488,12 @@ class TrialService:
             ).fetchone()
             if existing is None:
                 cursor = self.connection.execute(
-                    "INSERT INTO analyses(batch_id,batch_revision,protocol_sha256,input_sha256,algorithm_version,seed," 
-                    "result_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO analyses(batch_id,batch_revision,protocol_sha256,input_sha256,input_snapshot_json,"
+                    "algorithm_version,seed,result_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (
                         batch["batch_id"], job["batch_revision"], protocol_digest, input_digest,
-                        ALGORITHM_VERSION, protocol.seed, canonical_json(result), statistician_id, self._now(),
+                        snapshot_json, ALGORITHM_VERSION, protocol.seed, canonical_json(result),
+                        statistician_id, self._now(),
                     ),
                 )
                 analysis_id = cursor.lastrowid
@@ -465,7 +516,12 @@ class TrialService:
                 statistician_id,
                 {"analysis_id": analysis_id, "input_sha256": input_digest},
             )
-        return {"analysis_id": analysis_id, "input_sha256": input_digest, "result": result}
+        return {
+            "analysis_id": analysis_id,
+            "input_sha256": input_digest,
+            "algorithm_version": ALGORITHM_VERSION,
+            "result": result,
+        }
 
     def fail_job(self, worker_id: str, job_id: int, error: str, retry_seconds: int = 0) -> dict[str, Any]:
         available = isoformat(self.clock.now() + timedelta(seconds=retry_seconds))
@@ -478,6 +534,43 @@ class TrialService:
             if cursor.rowcount != 1:
                 raise InvalidState("任务未由当前工作进程持有")
         return {"job_id": job_id, "state": "queued", "available_at": available}
+
+    def review_analysis(
+        self, actor_id: str, analysis_id: int, verdict: str, note: str
+    ) -> dict[str, Any]:
+        self._require(actor_id, "analysis.review")
+        if verdict not in {"confirmed", "changes_requested"}:
+            raise ValidationFailed("未知复核结论")
+        if verdict == "changes_requested" and not note.strip():
+            raise ValidationFailed("要求修改时必须填写复核意见")
+        analysis = self.connection.execute(
+            "SELECT * FROM analyses WHERE analysis_id=?", (analysis_id,)
+        ).fetchone()
+        if analysis is None:
+            raise NotFound("分析版本不存在")
+        if analysis["created_by"] == actor_id:
+            raise Forbidden("统计负责人不能复核自己的分析")
+        batch = self.get_batch(analysis["batch_id"])
+        if batch["state"] != "analyzed" or batch["revision"] != analysis["batch_revision"]:
+            raise InvalidState("分析不是批次当前可复核版本")
+        try:
+            with transaction(self.connection, immediate=True):
+                cursor = self.connection.execute(
+                    "INSERT INTO analysis_reviews(analysis_id,batch_id,verdict,note,reviewed_by,reviewed_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (analysis_id, analysis["batch_id"], verdict, note, actor_id, self._now()),
+                )
+                review_id = cursor.lastrowid
+                self._audit(
+                    "analysis",
+                    str(analysis_id),
+                    "analysis.reviewed",
+                    actor_id,
+                    {"review_id": review_id, "batch_id": analysis["batch_id"], "verdict": verdict},
+                )
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("该统计负责人已复核过此分析版本") from exc
+        return {"review_id": review_id, "analysis_id": analysis_id, "verdict": verdict}
 
     def decide(
         self, actor_id: str, batch_id: str, analysis_id: int, decision: str, reason: str
@@ -495,6 +588,15 @@ class TrialService:
         batch = self.get_batch(batch_id)
         if batch["state"] != "analyzed" or batch["revision"] != analysis_row["batch_revision"]:
             raise InvalidState("分析不是批次当前可审批版本")
+        confirming = self.connection.execute(
+            "SELECT reviewed_by FROM analysis_reviews WHERE analysis_id=? AND verdict='confirmed' "
+            "ORDER BY review_id",
+            (analysis_id,),
+        ).fetchall()
+        if not confirming:
+            raise InvalidState("分析尚未经其他统计负责人复核确认")
+        if any(row["reviewed_by"] == actor_id for row in confirming):
+            raise Forbidden("复核人不能同时批准该分析")
         try:
             with transaction(self.connection, immediate=True):
                 cursor = self.connection.execute(
@@ -514,6 +616,28 @@ class TrialService:
             raise Conflict("该分析版本已经形成决定") from exc
         return {"batch_id": batch_id, "analysis_id": analysis_id, "decision": decision}
 
+    def latest_analysis(self, actor_id: str, batch_id: str) -> dict[str, Any]:
+        user = self._user(actor_id)
+        if user["role"] not in {"statistician", "approver", "auditor"}:
+            raise Forbidden("当前角色不能读取分析结果")
+        self.get_batch(batch_id)
+        row = self.connection.execute(
+            "SELECT * FROM analyses WHERE batch_id=? ORDER BY analysis_id DESC LIMIT 1", (batch_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("批次尚未完成分析")
+        result = json.loads(row["result_json"])
+        return {
+            "batch_id": batch_id,
+            "analysis_id": row["analysis_id"],
+            "algorithm_version": row["algorithm_version"],
+            "seed": row["seed"],
+            "input_sha256": row["input_sha256"],
+            "insufficient": result["insufficient"],
+            "conclusion": result["conclusion"],
+            "result": result,
+        }
+
     def report(self, actor_id: str, batch_id: str) -> dict[str, Any]:
         user = self._user(actor_id)
         if user["role"] not in {"statistician", "approver", "auditor"}:
@@ -524,10 +648,24 @@ class TrialService:
             "SELECT * FROM analyses WHERE batch_id=? ORDER BY analysis_id DESC LIMIT 1", (batch_id,)
         ).fetchone()
         decision_row = None
+        review_rows: list[sqlite3.Row] = []
         if analysis_row is not None:
             decision_row = self.connection.execute(
                 "SELECT * FROM decisions WHERE analysis_id=?", (analysis_row["analysis_id"],)
             ).fetchone()
+            review_rows = self.connection.execute(
+                "SELECT review_id,verdict,note,reviewed_by,reviewed_at FROM analysis_reviews "
+                "WHERE analysis_id=? ORDER BY review_id",
+                (analysis_row["analysis_id"],),
+            ).fetchall()
+        analysis_history = self.connection.execute(
+            "SELECT analysis_id,batch_revision,algorithm_version,input_sha256,created_by,created_at "
+            "FROM analyses WHERE batch_id=? ORDER BY analysis_id",
+            (batch_id,),
+        ).fetchall()
+        decision_history = self.connection.execute(
+            "SELECT * FROM decisions WHERE batch_id=? ORDER BY decision_id", (batch_id,)
+        ).fetchall()
         exclusions = self.connection.execute(
             "SELECT e.exclusion_id,e.observation_id,e.status,e.reason,e.requested_by,e.reviewed_by "
             "FROM exclusion_requests e JOIN observations o ON o.observation_id=e.observation_id "
@@ -550,11 +688,15 @@ class TrialService:
             "analysis": None if analysis_row is None else {
                 "analysis_id": analysis_row["analysis_id"],
                 "input_sha256": analysis_row["input_sha256"],
+                "input_snapshot": json.loads(analysis_row["input_snapshot_json"] or "[]"),
                 "algorithm_version": analysis_row["algorithm_version"],
                 "created_by": analysis_row["created_by"],
+                "reviews": [dict(row) for row in review_rows],
                 "result": json.loads(analysis_row["result_json"]),
             },
+            "analyses": [dict(row) for row in analysis_history],
             "decision": None if decision_row is None else dict(decision_row),
+            "decisions": [dict(row) for row in decision_history],
             "exclusions": [dict(row) for row in exclusions],
             "events": [dict(row) | {"payload": json.loads(row["payload_json"])} for row in events],
         }

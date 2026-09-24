@@ -121,6 +121,9 @@ def group_metric(
         metrics = getattr(row, "metrics")
         if metric_name not in metrics:
             raise KeyError(metric_name)
-        grouped.setdefault(getattr(row, "stratum_key"), []).append(metrics[metric_name])
+        value = metrics[metric_name]
+        if value is None:
+            continue
+        grouped.setdefault(getattr(row, "stratum_key"), []).append(value)
     return {key: summarize(values) for key, values in sorted(grouped.items())}
 

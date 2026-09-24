@@ -97,6 +97,20 @@ class JsonApplication:
                     self._actor(normalized_headers), parts[1], int(payload["expected_revision"])
                 )
                 return Response(200, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "batches" and parts[2] == "reopen":
+                result = self.service.reopen_batch(
+                    self._actor(normalized_headers), parts[1],
+                    int(payload["expected_revision"]), payload["reason"],
+                )
+                return Response(200, result)
+            if method == "GET" and len(parts) == 3 and parts[0] == "batches" and parts[2] == "analysis":
+                return Response(200, self.service.latest_analysis(self._actor(normalized_headers), parts[1]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "analyses" and parts[2] == "review":
+                result = self.service.review_analysis(
+                    self._actor(normalized_headers), int(parts[1]),
+                    payload["verdict"], payload.get("note", ""),
+                )
+                return Response(201, result)
             if method == "GET" and len(parts) == 3 and parts[0] == "batches" and parts[2] == "report":
                 return Response(200, self.service.report(self._actor(normalized_headers), parts[1]))
             if method == "POST" and path == "/exclusions":

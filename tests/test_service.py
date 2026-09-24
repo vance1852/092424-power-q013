@@ -6,8 +6,9 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
+from plant_science.analysis import ALGORITHM_VERSION
 from plant_science.clock import FrozenClock
-from plant_science.errors import Conflict, Forbidden, InvalidState
+from plant_science.errors import Conflict, Forbidden, InvalidState, ValidationFailed
 from plant_science.jsonio import load_json
 from plant_science.service import TrialService
 
@@ -24,6 +25,7 @@ class ServiceTests(unittest.TestCase):
         for user_id, role in (
             ("operator", "operator"),
             ("stat", "statistician"),
+            ("stat-2", "statistician"),
             ("approver", "approver"),
             ("auditor", "auditor"),
         ):
@@ -49,10 +51,13 @@ class ServiceTests(unittest.TestCase):
         self.service.seal_batch("stat", "batch-a", 2)
         job = self.service.claim_job("worker", 30)
         analysis = self.service.complete_job("worker", job["job_id"], "stat")
+        self.service.review_analysis("stat-2", analysis["analysis_id"], "confirmed", "复核通过")
         self.service.decide("approver", "batch-a", analysis["analysis_id"], "approved", "满足规则")
         report = self.service.report("auditor", "batch-a")
         self.assertEqual(report["batch"]["state"], "decided")
         self.assertEqual(report["analysis"]["result"]["conclusion"], "pass")
+        self.assertEqual(len(report["analysis"]["input_snapshot"]), 6)
+        self.assertEqual(report["analysis"]["reviews"][0]["reviewed_by"], "stat-2")
 
     def test_idempotent_replay_and_conflict(self) -> None:
         first = self.service.import_observations("operator", "batch-a", "key-1", self.rows)
@@ -118,6 +123,91 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(second["lease_owner"], "worker-b")
         with self.assertRaises(InvalidState):
             self.service.complete_job("worker-a", first["job_id"], "stat")
+
+    def _analyzed(self, key: str = "key-1", rows=None) -> dict:
+        rows = self.rows if rows is None else rows
+        if rows:
+            self.service.import_observations("operator", "batch-a", key, rows)
+        batch = self.service.get_batch("batch-a")
+        self.service.seal_batch("stat", "batch-a", batch["revision"])
+        job = self.service.claim_job("worker", 30)
+        return self.service.complete_job("worker", job["job_id"], "stat")
+
+    def test_analysis_records_snapshot_and_algorithm_version(self) -> None:
+        analysis = self._analyzed()
+        self.assertEqual(analysis["algorithm_version"], ALGORITHM_VERSION)
+        row = self.connection.execute(
+            "SELECT input_snapshot_json,algorithm_version,input_sha256 FROM analyses WHERE analysis_id=?",
+            (analysis["analysis_id"],),
+        ).fetchone()
+        self.assertEqual(row["algorithm_version"], ALGORITHM_VERSION)
+        snapshot = json.loads(row["input_snapshot_json"])
+        self.assertEqual(len(snapshot), 6)
+        self.assertEqual(snapshot[0]["stratum"], "clear-aisle")
+        self.assertEqual(row["input_sha256"], analysis["input_sha256"])
+
+    def test_decide_requires_confirmed_review(self) -> None:
+        analysis = self._analyzed()
+        with self.assertRaises(InvalidState):
+            self.service.decide("approver", "batch-a", analysis["analysis_id"], "approved", "跳过复核")
+
+    def test_review_role_separation(self) -> None:
+        analysis = self._analyzed()
+        with self.assertRaises(Forbidden):
+            self.service.review_analysis("stat", analysis["analysis_id"], "confirmed", "自我复核")
+        with self.assertRaises(Forbidden):
+            self.service.review_analysis("approver", analysis["analysis_id"], "confirmed", "越权复核")
+        with self.assertRaises(Forbidden):
+            self.service.review_analysis("operator", analysis["analysis_id"], "confirmed", "越权复核")
+
+    def test_review_is_recorded_once_per_reviewer(self) -> None:
+        analysis = self._analyzed()
+        self.service.review_analysis("stat-2", analysis["analysis_id"], "confirmed", "复核通过")
+        with self.assertRaises(Conflict):
+            self.service.review_analysis("stat-2", analysis["analysis_id"], "confirmed", "重复复核")
+
+    def test_changes_requested_requires_note(self) -> None:
+        analysis = self._analyzed()
+        with self.assertRaises(ValidationFailed):
+            self.service.review_analysis("stat-2", analysis["analysis_id"], "changes_requested", " ")
+
+    def test_backfill_preserves_historical_decision(self) -> None:
+        analysis = self._analyzed()
+        self.service.review_analysis("stat-2", analysis["analysis_id"], "confirmed", "复核通过")
+        self.service.decide("approver", "batch-a", analysis["analysis_id"], "needs_more_data", "样本量不足")
+        with self.assertRaises(InvalidState):
+            self.service.import_observations("operator", "batch-a", "key-2", self.rows)
+        batch = self.service.get_batch("batch-a")
+        reopened = self.service.reopen_batch("operator", "batch-a", batch["revision"], "补录横向人流工况")
+        self.assertEqual(reopened["state"], "running")
+        extra = [dict(item, source_batch="hall-b-20260924") for item in self.rows]
+        self.service.import_observations("operator", "batch-a", "key-2", extra)
+        followup = self._analyzed(key="key-3", rows=[])
+        self.assertNotEqual(followup["analysis_id"], analysis["analysis_id"])
+        self.assertNotEqual(followup["input_sha256"], analysis["input_sha256"])
+        self.service.review_analysis("stat-2", followup["analysis_id"], "confirmed", "补录后复核通过")
+        self.service.decide("approver", "batch-a", followup["analysis_id"], "approved", "补录后满足规则")
+        report = self.service.report("auditor", "batch-a")
+        self.assertEqual([item["decision"] for item in report["decisions"]], ["needs_more_data", "approved"])
+        self.assertEqual(len(report["analyses"]), 2)
+        self.assertEqual(report["decision"]["analysis_id"], followup["analysis_id"])
+
+    def test_reopen_rejected_after_final_decision(self) -> None:
+        analysis = self._analyzed()
+        self.service.review_analysis("stat-2", analysis["analysis_id"], "confirmed", "复核通过")
+        self.service.decide("approver", "batch-a", analysis["analysis_id"], "approved", "满足规则")
+        batch = self.service.get_batch("batch-a")
+        with self.assertRaises(InvalidState):
+            self.service.reopen_batch("operator", "batch-a", batch["revision"], "试图覆盖历史决定")
+
+    def test_stale_analysis_cannot_be_decided_after_reopen(self) -> None:
+        analysis = self._analyzed()
+        self.service.review_analysis("stat-2", analysis["analysis_id"], "confirmed", "复核通过")
+        self.service.decide("approver", "batch-a", analysis["analysis_id"], "needs_more_data", "样本量不足")
+        batch = self.service.get_batch("batch-a")
+        self.service.reopen_batch("operator", "batch-a", batch["revision"], "补录工况")
+        with self.assertRaises(InvalidState):
+            self.service.decide("approver", "batch-a", analysis["analysis_id"], "approved", "重复决定")
 
 
 if __name__ == "__main__":

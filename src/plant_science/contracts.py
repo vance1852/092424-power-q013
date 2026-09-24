@@ -200,7 +200,11 @@ class Protocol:
 
 @dataclass(frozen=True, slots=True)
 class Observation:
-    """一次已结构化的传感器任务测点。"""
+    """一次已结构化的传感器任务测点。
+
+    指标值可以是 None，表示该次任务缺少此读数（缺失），
+    与真实的零值和已剔除的测点严格区分。
+    """
 
     source_batch: str
     source_row: str
@@ -209,7 +213,7 @@ class Observation:
     protocol_version: int
     stratum_key: str
     observed_at: str
-    metrics: Mapping[str, Decimal]
+    metrics: Mapping[str, Decimal | None]
     excluded_reason: str | None
 
     @classmethod
@@ -228,9 +232,12 @@ class Observation:
         extra = sorted(set(metric_data) - set(expected))
         if missing or extra:
             raise ValidationError(f"测点指标不匹配：缺少 {missing}，多出 {extra}")
-        parsed: dict[str, Decimal] = {}
+        parsed: dict[str, Decimal | None] = {}
         for key, value in metric_data.items():
             metric = expected[key]
+            if value is None:
+                parsed[key] = None
+                continue
             number = _decimal(value, f"observation.metrics.{key}")
             if metric.kind == "binary" and number not in {Decimal(0), Decimal(1)}:
                 raise ValidationError(f"observation.metrics.{key} 必须是 0 或 1")
